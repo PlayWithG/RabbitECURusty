@@ -1,0 +1,379 @@
+-- Transmission Control for 4 gears; more, maybe later!
+-- https://rusefi.com/forum/viewtopic.php?f=5&t=2925
+
+-- TCU Lua Script: WOT Downshift RPM Curve, Renamed WOT Upshift Curve, Raw VSS, Spike Filter, Sequential Shifts, 5 Gauges, CAN TX
+
+-- Configuration Flags
+local enableGearErrorCheck = false
+local enableVssFiltering = true
+-- secondary box acting as TCU or build into ECU?
+local buildIntoEcu = false
+
+if not buildIntoEcu then
+  -- Sensor Declarations
+  local coolantTempSensor = Sensor.new("Clt")
+  local engineRpmSensor = Sensor.new("Rpm")
+  local manifoldPressureSensor = Sensor.new("Map")
+  local throttlePosSensor = Sensor.new("Tps1")
+  local vehicleSpeedSensor = Sensor.new("VehicleSpeed")
+  local detectedGearSensor = Sensor.new("DetectedGear")
+
+  -- Sensor Timeouts
+  local SENSOR_TIMEOUT_MILLISECONDS = 3000
+  coolantTempSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+  engineRpmSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+  manifoldPressureSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+  throttlePosSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+  vehicleSpeedSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+  detectedGearSensor:setTimeout(SENSOR_TIMEOUT_MILLISECONDS)
+end
+
+-- Core State Variables
+local intendedGear = 3
+local initialDataReceived = false
+local lastKnownRawVssFromCan = nil
+local lastSetVssForLogic = 0.0
+local idleStateTriggeredShiftToFirst = false
+
+-- PWM Configuration
+local SOLENOID_A_PWM_INDEX = 0
+local SOLENOID_B_PWM_INDEX = 1
+local PWM_FREQUENCY = 10
+
+-- Solenoid State Strings
+local solenoidAStateString = "OFF"
+local solenoidBStateString = "OFF"
+
+-- Shift Process Timers and Flags
+local shiftInProgressTimer = Timer.new()
+local isShifting = false
+local gearMatchTimer = Timer.new()
+local isCheckingGearMatch = false
+local shiftErrorActive = false
+
+-- User-Configurable Settings
+local wotTpsThresholdSetting
+local shiftExecutionTimeSecondsSetting
+local downshiftLockoutRpmSetting
+local gearMatchTimeoutSecondsSetting
+local numberOfGearSolenoidsSetting
+local idleRpmThresholdSetting
+local idleTpsThresholdSetting
+local effectivelyStoppedRawVssThreshold = 50
+local vssSpikeDeltaThresholdSetting
+local maxRealisticRawVssSetting
+
+-- Table and Curve Indices
+local upshiftScheduleTableIndex
+local downshiftScheduleTableIndex
+local wotUpshiftRpmCurveIndex       -- RENAMED
+local wotDownshiftRpmCurveIndex     -- NEW
+local solenoidPatternCurveIndex
+
+-- CAN Transmit Configuration
+local SHIFT_STATUS_CAN_ID = 0x701
+local CAN_BUS_INDEX = 1
+
+function getTwoBytesUnsignedLsb(data, startIndex)
+    local msb = data[startIndex]
+    local lsb = data[startIndex + 1]
+    if msb == nil or lsb == nil then return nil end
+    return (msb * 256) + lsb
+end
+
+function getSignedByte(rawValue)
+    if rawValue > 127 then return rawValue - 256
+    else return rawValue end
+end
+
+function setSolenoidsForGear(targetGear)
+    if solenoidPatternCurveIndex == nil then
+        print("ERROR: Solenoid pattern curve index is nil.")
+        if numberOfGearSolenoidsSetting >= 1 then setPwmDuty(SOLENOID_A_PWM_INDEX, 0.0); solenoidAStateString = "OFF" end
+        if numberOfGearSolenoidsSetting >= 2 then setPwmDuty(SOLENOID_B_PWM_INDEX, 0.0); solenoidBStateString = "OFF" end
+        return
+    end
+    local patternCode = curve(solenoidPatternCurveIndex, targetGear)
+    if patternCode == nil then
+        print("WARNING: No solenoid pattern for gear " .. targetGear)
+        patternCode = 0
+    end
+    patternCode = math.floor(patternCode)
+    local tempPattern = patternCode
+    if numberOfGearSolenoidsSetting >= 1 then
+        local solenoidADutyCycle = 0.0
+        if numberOfGearSolenoidsSetting == 1 then if tempPattern == 1 then solenoidADutyCycle = 1.0 end
+        elseif numberOfGearSolenoidsSetting == 2 then if math.floor(tempPattern / 10) == 1 then solenoidADutyCycle = 1.0 end
+        elseif numberOfGearSolenoidsSetting == 3 then if math.floor(tempPattern / 100) == 1 then solenoidADutyCycle = 1.0 end
+        end
+        setPwmDuty(SOLENOID_A_PWM_INDEX, solenoidADutyCycle)
+        solenoidAStateString = (solenoidADutyCycle == 1.0) and "ON" or "OFF"
+    else solenoidAStateString = "N/A" end
+    if numberOfGearSolenoidsSetting >= 2 then
+        local solenoidBDutyCycle = 0.0
+        if numberOfGearSolenoidsSetting == 2 then if tempPattern % 10 == 1 then solenoidBDutyCycle = 1.0 end
+        elseif numberOfGearSolenoidsSetting == 3 then if math.floor((tempPattern % 100) / 10) == 1 then solenoidBDutyCycle = 1.0 end
+        end
+        setPwmDuty(SOLENOID_B_PWM_INDEX, solenoidBDutyCycle)
+        solenoidBStateString = (solenoidBDutyCycle == 1.0) and "ON" or "OFF"
+    else solenoidBStateString = "N/A" end
+end
+
+function initializeShiftLogic()
+    wotTpsThresholdSetting = findSetting("wotTps", 90.0)
+    local shiftExecutionTimeMsSetting = findSetting("shiftTime", 500)
+    shiftExecutionTimeSecondsSetting = shiftExecutionTimeMsSetting / 1000.0
+    downshiftLockoutRpmSetting = findSetting("dsLockRpm", 7000)
+    local gearMatchTimeoutMsSetting = findSetting("gearMatch", 3000)
+    gearMatchTimeoutSecondsSetting = gearMatchTimeoutMsSetting / 1000.0
+    numberOfGearSolenoidsSetting = findSetting("numGearSol", 2)
+    idleRpmThresholdSetting = 1300
+    idleTpsThresholdSetting = 1.0
+    vssSpikeDeltaThresholdSetting = 200
+    maxRealisticRawVssSetting = 2400
+
+    upshiftScheduleTableIndex = findTableIndex("upSched")
+    downshiftScheduleTableIndex = findTableIndex("downSched")
+    wotUpshiftRpmCurveIndex = findCurveIndex("wotUpRpm")     -- Use new key "wotUpRpm"
+    wotDownshiftRpmCurveIndex = findCurveIndex("wotDsRpm")   -- NEW: Use key "wotDsRpm"
+    solenoidPatternCurveIndex = findCurveIndex("solPattern")
+
+    if upshiftScheduleTableIndex == nil or downshiftScheduleTableIndex == nil or
+       wotUpshiftRpmCurveIndex == nil or wotDownshiftRpmCurveIndex == nil or
+       solenoidPatternCurveIndex == nil then
+        print("ERROR: One or more essential tables/curves not found.")
+    end
+    if numberOfGearSolenoidsSetting >= 1 then startPwm(SOLENOID_A_PWM_INDEX, PWM_FREQUENCY, 0.0) end
+    if numberOfGearSolenoidsSetting >= 2 then startPwm(SOLENOID_B_PWM_INDEX, PWM_FREQUENCY, 0.0) end
+    setSolenoidsForGear(intendedGear)
+end
+
+initializeShiftLogic()
+
+function onPacket360(bus, id, dlc, data)
+        engineRpmSensor:set(getTwoBytesUnsignedLsb(data, 1))
+        manifoldPressureSensor:set(getTwoBytesUnsignedLsb(data, 3) / 10.0)
+        local tpsCanVal = getTwoBytesUnsignedLsb(data, 5)
+        if tpsCanVal ~= nil then
+             throttlePosSensor:set(tpsCanVal / 10.0)
+        end
+end
+
+-- todo: this method has too many responsibilities, need to extract CAN RX? filtering? actual TCU logic?
+function onPacket370(bus, id, dlc, data)
+        idleStateTriggeredShiftToFirst = false
+
+        local vssFromCan = getTwoBytesUnsignedLsb(data, 1)
+        lastKnownRawVssFromCan = vssFromCan
+
+        local currentVssForLogic
+        local useLastVss = false
+
+        if vssFromCan == nil then
+            useLastVss = true
+        elseif enableVssFiltering and initialDataReceived then
+            if vssFromCan > maxRealisticRawVssSetting then
+                useLastVss = true
+            elseif math.abs(vssFromCan - lastSetVssForLogic) > vssSpikeDeltaThresholdSetting then
+                useLastVss = true
+            end
+        end
+
+        if useLastVss then
+            currentVssForLogic = lastSetVssForLogic
+        else
+            currentVssForLogic = vssFromCan
+        end
+
+        if currentVssForLogic == nil then currentVssForLogic = 0.0 end
+
+        if not initialDataReceived then
+            if getSensor("Rpm") ~= nil and getSensor("Tps1") ~= nil and vssFromCan ~= nil then
+                initialDataReceived = true
+                if enableVssFiltering then lastSetVssForLogic = currentVssForLogic end
+            end
+        end
+
+        local currentRpm = getSensor("Rpm")
+        local currentTps = getSensor("Tps1")
+        local triggerShiftToFirstForIdle = false
+
+        if currentRpm ~= nil and currentTps ~= nil then
+            if currentRpm < idleRpmThresholdSetting and currentTps < idleTpsThresholdSetting then
+                local actualGear = getSensor("DetectedGear")
+                if actualGear ~= nil and actualGear == 0 then
+                    if currentVssForLogic < effectivelyStoppedRawVssThreshold then
+                        triggerShiftToFirstForIdle = true
+                        idleStateTriggeredShiftToFirst = true
+                    end
+                end
+            end
+        end
+
+        vehicleSpeedSensor:set(currentVssForLogic)
+        lastSetVssForLogic = currentVssForLogic
+
+        if isShifting then
+            if shiftInProgressTimer:getElapsedSeconds() >= shiftExecutionTimeSecondsSetting then
+                isShifting = false
+            end
+        end
+
+        if triggerShiftToFirstForIdle and intendedGear ~= 1 and not isShifting then
+            intendedGear = 1
+            setSolenoidsForGear(intendedGear)
+            isShifting = true; shiftInProgressTimer:reset()
+            isCheckingGearMatch = true; gearMatchTimer:reset()
+            shiftErrorActive = false
+        end
+
+        if not isShifting and initialDataReceived and
+           upshiftScheduleTableIndex ~= nil and downshiftScheduleTableIndex ~= nil and
+           wotUpshiftRpmCurveIndex ~= nil and wotDownshiftRpmCurveIndex ~= nil and -- Added new curve check
+           solenoidPatternCurveIndex ~= nil then
+
+            currentRpm = getSensor("Rpm")
+            currentTps = getSensor("Tps1")
+
+            if currentRpm == nil or currentTps == nil then
+                -- Skip
+            else
+                local isWOT = (currentTps >= wotTpsThresholdSetting)
+                local newPotentialDesiredGear = intendedGear
+
+                -- 1. WOT Upshift Logic
+                if isWOT and intendedGear < 4 then
+                    local wotTargetRpm = curve(wotUpshiftRpmCurveIndex, intendedGear)
+                    if wotTargetRpm ~= nil and currentRpm >= wotTargetRpm then
+                        newPotentialDesiredGear = intendedGear + 1
+                    end
+                end
+
+                -- 2. WOT Downshift Logic
+                if newPotentialDesiredGear == intendedGear and isWOT and intendedGear > 1 then
+                    if wotDownshiftRpmCurveIndex ~= nil then
+                        local wotTargetRpmForDownshift = curve(wotDownshiftRpmCurveIndex, intendedGear)
+                        if wotTargetRpmForDownshift ~= nil and currentRpm < wotTargetRpmForDownshift then
+                            if currentRpm <= downshiftLockoutRpmSetting then
+                                newPotentialDesiredGear = intendedGear - 1
+                            end
+                        end
+                    end
+                end
+
+                -- 3. Table-Based Downshift Logic
+                if newPotentialDesiredGear == intendedGear and intendedGear > 1 then
+                    local yAxisForTable = intendedGear
+                    local targetVssForDownshift = table3d(downshiftScheduleTableIndex, currentTps, yAxisForTable)
+                    if targetVssForDownshift ~= nil and currentVssForLogic <= targetVssForDownshift and currentRpm <= downshiftLockoutRpmSetting then
+                        newPotentialDesiredGear = intendedGear - 1
+                    end
+                end
+
+                -- 4. Table-Based Upshift Logic
+                if newPotentialDesiredGear == intendedGear and intendedGear < 4 then
+                    local yAxisForTable = intendedGear
+                    local vssForTableLookup = currentVssForLogic
+                    if currentRpm < 1200 and vssForTableLookup < effectivelyStoppedRawVssThreshold then
+                        vssForTableLookup = 0.0
+                    end
+
+                    local targetVssForUpshift = table3d(upshiftScheduleTableIndex, currentTps, yAxisForTable)
+                    if targetVssForUpshift ~= nil and vssForTableLookup >= targetVssForUpshift then
+                        newPotentialDesiredGear = intendedGear + 1
+                    end
+                end
+
+                -- Shift Execution
+                if newPotentialDesiredGear ~= intendedGear and newPotentialDesiredGear >= 1 and newPotentialDesiredGear <= 4 then
+                    intendedGear = newPotentialDesiredGear
+                    setSolenoidsForGear(intendedGear)
+                    isShifting = true; shiftInProgressTimer:reset()
+                    isCheckingGearMatch = true; gearMatchTimer:reset()
+                    shiftErrorActive = false
+                end
+            end
+        end
+end
+
+function onCanRx(bus, id, dlc, data)
+    if id == 0x360 then
+    elseif id == 0x3E0 then
+        coolantTempSensor:set(getTwoBytesUnsignedLsb(data, 1) / 100.0)
+    elseif id == 0x470 then
+        local rawGearValue = data[8]
+        if rawGearValue ~= nil then
+            detectedGearSensor:set(getSignedByte(rawGearValue))
+        end
+    end
+end
+
+if not buildIntoEcu then
+  canRxAdd(0x360, onPacket360)
+  canRxAdd(0x3E0)
+  canRxAdd(0x370, onPacket370)
+  canRxAdd(0x470)
+end
+
+function onTick()
+    if enableGearErrorCheck and isCheckingGearMatch then
+        local actualGearValue = getSensor("DetectedGear")
+        if actualGearValue ~= nil and intendedGear == actualGearValue then
+            shiftErrorActive = false
+            isCheckingGearMatch = false
+        elseif gearMatchTimer:getElapsedSeconds() >= gearMatchTimeoutSecondsSetting then
+            shiftErrorActive = true
+            isCheckingGearMatch = false
+            print("ERROR: Gear match timeout! Intended: " .. intendedGear .. ", Actual: " .. (actualGearValue or "nil"))
+        end
+    elseif not enableGearErrorCheck and isCheckingGearMatch then
+        isCheckingGearMatch = false
+        shiftErrorActive = false
+    end
+
+    setLuaGauge(1, intendedGear)
+
+    local solenoidComboValue = 0
+    if solenoidAStateString == "ON" and solenoidBStateString == "ON" then
+        solenoidComboValue = 11
+    elseif solenoidAStateString == "ON" and solenoidBStateString == "OFF" then
+        solenoidComboValue = 10
+    elseif solenoidAStateString == "OFF" and solenoidBStateString == "ON" then
+        solenoidComboValue = 1
+    end
+    setLuaGauge(2, solenoidComboValue)
+
+    setLuaGauge(3, idleStateTriggeredShiftToFirst and 1 or 0)
+
+    local currentTpsForGauges = getSensor("Tps1")
+    local currentSpeedForGauges = lastSetVssForLogic
+    local placeholderValue = 999
+
+    local upshiftDistance = placeholderValue
+    if currentTpsForGauges ~= nil and intendedGear < 4 and upshiftScheduleTableIndex ~= nil then
+        local targetVss = table3d(upshiftScheduleTableIndex, currentTpsForGauges, intendedGear)
+        if targetVss ~= nil then
+            upshiftDistance = targetVss - currentSpeedForGauges
+        end
+    end
+    setLuaGauge(4, upshiftDistance)
+
+    local downshiftDistance = placeholderValue
+    if currentTpsForGauges ~= nil and intendedGear > 1 and downshiftScheduleTableIndex ~= nil then
+        local targetVss = table3d(downshiftScheduleTableIndex, currentTpsForGauges, intendedGear)
+        if targetVss ~= nil then
+            downshiftDistance = currentSpeedForGauges - targetVss
+        end
+    end
+    setLuaGauge(5, downshiftDistance)
+
+    local shiftingStatusPayload = {}
+    if isShifting then
+        shiftingStatusPayload[1] = 1
+    else
+        shiftingStatusPayload[1] = 0
+    end
+    txCan(CAN_BUS_INDEX, SHIFT_STATUS_CAN_ID, 0, shiftingStatusPayload)
+end
+
+setTickRate(100)
